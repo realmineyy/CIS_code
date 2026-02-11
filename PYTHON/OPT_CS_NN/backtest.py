@@ -51,6 +51,7 @@ def expected_move_model(price, iv, dte, hist_move_pct, rv_move, straddle_proxy):
     return sum(w * v for w, v in components)
 
 
+
 # =============================
 # Backtest Engine
 # =============================
@@ -136,9 +137,9 @@ def backtest_earnings_range(
 # =============================
 
 if __name__ == "__main__":
-    df, summary = backtest_earnings_range("HOOD", lookback=8)
+    df, summary = backtest_earnings_range("FDX", lookback=8)
 
-    print("\n--- Earnings Range Backtest (HOOD) ---\n")
+    print("\n--- Earnings Range Backtest (FDX) ---\n")
     print(df.to_string(index=False))
 
     print("\n--- Summary ---")

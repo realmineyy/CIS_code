@@ -10,6 +10,8 @@ import os
 
 LOOKBACK_EARNINGS = 8
 SCAN_DAYS = 7
+MIN_EXPECTED_MOVE_PCT = 0.01  # 1% floor
+
 
 # =============================
 # Helpers
@@ -29,7 +31,7 @@ def get_earnings_date(ticker):
     return None
 
 
-def get_next_expirations(ticker, earnings_date):
+def get_next_expiration(ticker, earnings_date):
     expirations = yf.Ticker(ticker).options
     for exp in expirations:
         exp_dt = pd.to_datetime(exp)
@@ -48,6 +50,8 @@ def iv_expected_move(price, iv, dte):
 
 def realized_vol_move(price, hist, days=7):
     returns = hist["Close"].pct_change().dropna()
+    if len(returns) < days:
+        return price * returns.std()
     return price * returns[-days:].std()
 
 
@@ -60,10 +64,13 @@ def get_atm_straddle_move(ticker, expiration, price):
     call = calls[calls["strike"] == atm_strike].iloc[0]
     put = puts[puts["strike"] == atm_strike].iloc[0]
 
-    if call["bid"] == 0 or put["bid"] == 0:
+    if call["bid"] <= 0 or put["bid"] <= 0:
         return None
 
-    return (call["bid"] + call["ask"]) / 2 + (put["bid"] + put["ask"]) / 2
+    call_mid = (call["bid"] + call["ask"]) / 2
+    put_mid = (put["bid"] + put["ask"]) / 2
+
+    return call_mid + put_mid
 
 
 # =============================
@@ -73,6 +80,10 @@ def get_atm_straddle_move(ticker, expiration, price):
 def historical_earnings_analysis(ticker, lookback=8):
     stock = yf.Ticker(ticker)
     prices = stock.history(period="4y")
+
+    if prices.empty or not hasattr(stock, "earnings_dates"):
+        return None
+
     earnings = stock.earnings_dates.index[:lookback]
 
     actual_moves = []
@@ -83,17 +94,20 @@ def historical_earnings_analysis(ticker, lookback=8):
         date = pd.to_datetime(date)
 
         try:
-            before = prices.loc[:date].iloc[-2]["Close"]
-            after = prices.loc[date:].iloc[1]["Close"]
+            prices_before = prices.loc[prices.index < date]
+            prices_after = prices.loc[prices.index > date]
+
+            if len(prices_before) < 1 or len(prices_after) < 1:
+                continue
+
+            before = prices_before.iloc[-1]["Close"]
+            after = prices_after.iloc[0]["Close"]
 
             actual = abs(after - before)
             signed = after - before
 
-            # IMPLIED MOVE PROXY:
-            # Use 1-day IV-style proxy (earnings are overnight)
-            hist = prices.loc[:date].tail(20)
+            hist = prices_before.tail(20)
             iv_proxy = hist["Close"].pct_change().std() * sqrt(252)
-
             implied = before * iv_proxy * sqrt(2 / 365)
 
             if implied <= 0:
@@ -107,23 +121,15 @@ def historical_earnings_analysis(ticker, lookback=8):
             continue
 
     if len(actual_moves) < 5:
-        return {"Regime": "INSUFFICIENT_DATA"}
+        return None
 
     actual_moves = np.array(actual_moves)
     implied_moves = np.array(implied_moves)
     signed_moves = np.array(signed_moves)
 
-    # ---------------------------
-    # Metrics
-    # ---------------------------
-
     rir = np.mean(actual_moves / implied_moves)
     stability = np.std(actual_moves / implied_moves)
     directional_bias = abs(np.mean(signed_moves)) / np.mean(actual_moves)
-
-    # ---------------------------
-    # Classification
-    # ---------------------------
 
     if rir < 0.8 and stability < 0.6:
         regime = "IV_OVERPRICED"
@@ -153,22 +159,13 @@ def probability_price_in_range(price, lower, upper, expected_move):
     return norm.cdf(z_high) - norm.cdf(z_low)
 
 
-def confidence_score(hist, expected_move):
-    volatility_penalty = expected_move / (hist["std"] + 1e-6)
-    score = 1 - min(1, volatility_penalty / 3)
-    return round(score * 100, 2)
-
-
-def blended_expected_move(hist, iv_move):
-    return (
-        0.45 * hist["avg"] +
-        0.25 * hist["p75"] +
-        0.30 * iv_move
+def confidence_score(pop, stability, rir):
+    score = (
+        0.5 * pop +
+        0.3 * (1 - min(stability, 1)) +
+        0.2 * min(rir / 1.2, 1)
     )
-
-def iv_event_move(price, iv, dte):
-    return (price * iv * sqrt(dte / 365)) / price
-
+    return round(score * 100, 2)
 
 
 # =============================
@@ -179,16 +176,29 @@ def analyze_earnings_trade(ticker):
     stock = yf.Ticker(ticker)
     hist = stock.history(period="3mo")
 
+    if hist.empty:
+        return None
+
     price = get_stock_price(ticker)
     earnings_date = get_earnings_date(ticker)
-    expiration = get_next_expirations(ticker, earnings_date)
+
+    if not earnings_date:
+        return None
+
+    expiration = get_next_expiration(ticker, earnings_date)
+    if not expiration:
+        return None
 
     dte = (datetime.strptime(expiration, "%Y-%m-%d") - datetime.today()).days
+    if dte <= 0:
+        return None
 
     chain = stock.option_chain(expiration)
-    front_iv = chain.calls["impliedVolatility"].mean()
+    front_iv = chain.calls["impliedVolatility"].dropna().median()
 
-    # -------- Expected Move --------
+    if not front_iv or front_iv <= 0:
+        return None
+
     straddle = get_atm_straddle_move(ticker, expiration, price)
     iv_move = iv_expected_move(price, front_iv, dte)
     rv_move = realized_vol_move(price, hist)
@@ -199,32 +209,33 @@ def analyze_earnings_trade(ticker):
         0.2 * rv_move
     )
 
-    # -------- Historical Regime --------
+    expected_move = max(expected_move, price * MIN_EXPECTED_MOVE_PCT)
+
     hist_behavior = historical_earnings_analysis(ticker)
-
     if not hist_behavior:
-        trade_type = "SKIP"
-        confidence = 0
+        return None
+
+    regime = hist_behavior["Regime"]
+
+    if regime == "IV_OVERPRICED":
+        trade_type = "IRON_CONDOR"
+        buffer = 1.3
+    elif regime == "IV_UNDERPRICED":
+        trade_type = "IRON_FLY"
+        buffer = 0.9
     else:
-        regime = hist_behavior["Regime"]
+        trade_type = "SKIP"
+        buffer = 1.5
 
-        if regime == "IV_OVERPRICED":
-            trade_type = "IRON_CONDOR"
-            buffer = 1.3
-        elif regime == "IV_UNDERPRICED":
-            trade_type = "IRON_FLY"
-            buffer = 0.9
-        else:
-            trade_type = "SKIP"
-            buffer = 1.5
+    lower = price - expected_move * buffer
+    upper = price + expected_move * buffer
 
-        lower = price - expected_move * buffer
-        upper = price + expected_move * buffer
-
-        pop = probability_price_in_range(price, lower, upper, expected_move)
-        efficiency = expected_move / max(expected_move, 0.01)
-
-        confidence = confidence_score(pop, efficiency)
+    pop = probability_price_in_range(price, lower, upper, expected_move)
+    confidence = confidence_score(
+        pop,
+        hist_behavior["Stability"],
+        hist_behavior["RIR"]
+    )
 
     return {
         "Ticker": ticker,
@@ -236,8 +247,13 @@ def analyze_earnings_trade(ticker):
         "Lower Bound": round(lower, 2) if trade_type != "SKIP" else "N/A",
         "Upper Bound": round(upper, 2) if trade_type != "SKIP" else "N/A",
         "Confidence Score": confidence,
-        "Earnings Regime": hist_behavior["Regime"] if hist_behavior else "UNKNOWN"
+        "Earnings Regime": regime
     }
+
+
+# =============================
+# SP500 Scan
+# =============================
 
 def get_sp500_tickers():
     base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -248,27 +264,31 @@ def get_sp500_tickers():
 
     return data["tickers"]
 
+
 def scan_sp500_earnings():
     results = []
     tickers = get_sp500_tickers()
+    cutoff = datetime.now().date() + timedelta(days=SCAN_DAYS)
 
     for t in tickers:
         try:
             r = analyze_earnings_trade(t)
-            if r and r["Confidence"] > 60:
-                if r["Earnings"] <= (datetime.now().date() + timedelta(days=SCAN_DAYS)):
-                    results.append(r)
+            if not r:
+                continue
+
+            if (
+                r["Confidence Score"] >= 60 and
+                r["Earnings Date"] <= cutoff
+            ):
+                results.append(r)
+
         except:
             continue
 
-    return pd.DataFrame(results).sort_values("Confidence Score", ascending=False)
+    if not results:
+        return pd.DataFrame()
 
-def plot_histogram(hist, expected):
-    plt.hist(hist["raw"], bins=10, alpha=0.7)
-    plt.axvline(expected, color="red", label="Expected Move")
-    plt.legend()
-    plt.title("Historical Earnings Moves vs Model")
-    plt.show()
+    return pd.DataFrame(results).sort_values("Confidence Score", ascending=False)
 
 
 # =============================
